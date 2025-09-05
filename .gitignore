@@ -1,0 +1,29 @@
+# Python cache / build
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Local env files
+.env
+.env.*
+
+# Mac / OS junk
+.DS_Store
+
+# Virtual env (even if you don't use it, safe to ignore)
+.venv/
+venv/
+
+# App caches / data
+.site_cache/
+data/*
+!data/.gitkeep
+
+# Generated indexes (Step 3+)
+index.pkl
+emb_index.pkl
+
+# Logs
+*.log
