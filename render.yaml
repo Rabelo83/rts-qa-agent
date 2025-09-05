@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: rts-qa-agent
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn -w 2 -k gthread -b 0.0.0.0:$PORT app:app"
+    envVars:
+      - key: SITE_SEED_URL
+        value: https://alfredorabelo.com/
+      - key: SITE_ALLOWED_HOST
+        value: alfredorabelo.com
+      - key: CRAWL_MAX_DEPTH
+        value: "2"
+      - key: CACHE_DIR
+        value: /opt/render/project/src/.site_cache
