@@ -30,14 +30,23 @@ SITE_ALLOWED_HOST = os.environ.get("SITE_ALLOWED_HOST", "alfredorabelo.com").str
 CRAWL_MAX_DEPTH = int(os.environ.get("CRAWL_MAX_DEPTH", "2"))
 CACHE_DIR = os.environ.get("CACHE_DIR", ".site_cache")
 RATE_LIMIT = float(os.environ.get("RATE_LIMIT", "1.0"))  # seconds between requests
+RESPECT_ROBOTS = os.environ.get("RESPECT_ROBOTS", "true").lower() != "false"  # set to false to diagnose
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 CHUNKS_PATH = os.path.join(DATA_DIR, "chunks.jsonl")
 TIMETABLES_PATH = os.path.join(DATA_DIR, "timetables.json")  # NEW
 
+# Accept both bare and www host variants
+_allowed_hosts = {SITE_ALLOWED_HOST.lower()}
+if SITE_ALLOWED_HOST.lower().startswith("www."):
+    _allowed_hosts.add(SITE_ALLOWED_HOST.lower()[4:])
+else:
+    _allowed_hosts.add("www." + SITE_ALLOWED_HOST.lower())
+
 HEADERS = {
-    "User-Agent": "RTS-QA-Agent/1.0 (+https://example.com)"
+    # friendlier UA; some sites block generic bots
+    "User-Agent": "Mozilla/5.0 (compatible; RTS-QA-Agent/1.0)"
 }
 
 # ------------------------- Helpers -------------------------
@@ -52,8 +61,8 @@ def norm_url(u: str) -> str:
         u = urlparse.urljoin(SITE_SEED_URL, u)
         parsed = urlparse.urlparse(u)
 
-    # Must stay within allowed host
-    if parsed.hostname and parsed.hostname.lower() != SITE_ALLOWED_HOST.lower():
+    host = (parsed.hostname or "").lower()
+    if host not in _allowed_hosts:
         return ""
 
     # Remove fragments and query strings for stability
@@ -77,6 +86,8 @@ def load_robots_txt(seed_url: str) -> RobotFileParser:
     return rp
 
 def allowed_by_robots(rp: RobotFileParser, url: str) -> bool:
+    if not RESPECT_ROBOTS:
+        return True
     return rp.can_fetch(HEADERS["User-Agent"], url)
 
 def clean_html_to_text(html: str) -> Tuple[str, str]:
@@ -120,8 +131,12 @@ def crawl(seed_url: str, max_depth: int, rate_limit: float) -> Tuple[List[PageDo
     rp = load_robots_txt(seed_url)
 
     q = queue.Queue()
-    q.put((seed_url, 0))
-    seen.add(norm_url(seed_url))
+    seed_norm = norm_url(seed_url)
+    if seed_norm:
+        q.put((seed_norm, 0))
+        seen.add(seed_norm)
+    else:
+        print(f"[ingest] WARNING: seed URL rejected by host filter: {seed_url}")
 
     while not q.empty():
         url, depth = q.get()
@@ -130,15 +145,18 @@ def crawl(seed_url: str, max_depth: int, rate_limit: float) -> Tuple[List[PageDo
         if depth > max_depth:
             continue
         if not allowed_by_robots(rp, url):
+            print(f"[ingest] robots disallowed: {url}")
             continue
 
         try:
             time.sleep(rate_limit)
             resp = requests.get(url, headers=HEADERS, timeout=15)
-        except requests.RequestException:
+        except requests.RequestException as e:
+            print(f"[ingest] request error: {url} -> {e}")
             continue
 
         if resp.status_code != 200 or not is_html_response(resp):
+            print(f"[ingest] skipped non-HTML or status {resp.status_code}: {url}")
             continue
 
         # Clean text for search index
@@ -151,9 +169,9 @@ def crawl(seed_url: str, max_depth: int, rate_limit: float) -> Tuple[List[PageDo
             rows = extract_timetables_from_html(resp.text, url=url, title_text=title)
             if rows:
                 tt_records.extend(rows)
-        except Exception:
+        except Exception as e:
             # Don't let parsing issues stop the crawl
-            pass
+            print(f"[timetable] parse error on {url}: {e}")
 
         # Enqueue links if we haven't exceeded depth
         if depth < max_depth:
@@ -233,7 +251,8 @@ def save_timetables(records: List[Dict], path: str) -> int:
 
 def main(build_index: bool):
     print(f"[ingest] Seed: {SITE_SEED_URL}  Host: {SITE_ALLOWED_HOST}  Depth: {CRAWL_MAX_DEPTH}")
-    print(f"[ingest] Rate limit: {RATE_LIMIT}s  Output: {CHUNKS_PATH}")
+    print(f"[ingest] Respect robots: {RESPECT_ROBOTS}  Rate limit: {RATE_LIMIT}s")
+    print(f"[ingest] Output: {CHUNKS_PATH}")
     docs, tt = crawl(SITE_SEED_URL, CRAWL_MAX_DEPTH, RATE_LIMIT)
     print(f"[ingest] Crawled pages: {len(docs)}")
     n_chunks = save_chunks(docs, CHUNKS_PATH)
@@ -243,16 +262,21 @@ def main(build_index: bool):
     print(f"[ingest] Timetable rows saved: {n_tt} -> {TIMETABLES_PATH}")
 
     if build_index:
-        try:
-            import retriever  # we will add this file next (already added in your repo)
-            retriever.build_index_from_chunks(
-                chunks_path=CHUNKS_PATH,
-                index_path=os.path.join(DATA_DIR, "index.pkl"),
-                catalog_path=os.path.join(DATA_DIR, "catalog.jsonl"),
-            )
-            print("[ingest] Index built successfully.")
-        except ImportError:
-            print("[ingest] retriever.py not found yet. Skipping index build.")
+        if n_chunks == 0:
+            print("[ingest] WARNING: 0 chunks written; skipping index build.")
+        else:
+            try:
+                import retriever  # already in your repo
+                retriever.build_index_from_chunks(
+                    chunks_path=CHUNKS_PATH,
+                    index_path=os.path.join(DATA_DIR, "index.pkl"),
+                    catalog_path=os.path.join(DATA_DIR, "catalog.jsonl"),
+                )
+                print("[ingest] Index built successfully.")
+            except ImportError:
+                print("[ingest] retriever.py not found yet. Skipping index build.")
+            except Exception as e:
+                print(f"[ingest] ERROR building index: {e}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Crawl site and build chunks (and optionally index).")
