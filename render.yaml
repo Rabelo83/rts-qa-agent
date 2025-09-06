@@ -3,10 +3,9 @@ services:
     name: rts-qa-agent
     env: python
     plan: free
-    # Build the app AND the search index during the build phase
-    buildCommand: "pip install -r requirements.txt && python ingest.py --build-index"
-    # Then just start the web server
-    startCommand: "gunicorn -w 2 -k gthread -b 0.0.0.0:$PORT app:app"
+    buildCommand: "pip install -r requirements.txt"
+    # ⬇️ Rebuild the index each time the service starts, then launch the app
+    startCommand: "python ingest.py --build-index && gunicorn -w 2 -k gthread -b 0.0.0.0:$PORT app:app"
     envVars:
       - key: SITE_SEED_URL
         value: https://alfredorabelo.com/
@@ -16,6 +15,6 @@ services:
         value: "2"
       - key: CACHE_DIR
         value: /opt/render/project/src/.site_cache
-      # Optional: uncomment to change crawl speed
+      # optional: speed up crawl a bit
       # - key: RATE_LIMIT
       #   value: "0.5"
