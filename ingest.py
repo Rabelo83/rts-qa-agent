@@ -29,7 +29,8 @@ CRAWL_MAX_DEPTH = int(os.environ.get("CRAWL_MAX_DEPTH", "2"))
 CACHE_DIR = os.environ.get("CACHE_DIR", ".site_cache")
 RATE_LIMIT = float(os.environ.get("RATE_LIMIT", "1.0"))  # seconds between requests
 
-DATA_DIR = "data"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
 CHUNKS_PATH = os.path.join(DATA_DIR, "chunks.jsonl")
 
 HEADERS = {
