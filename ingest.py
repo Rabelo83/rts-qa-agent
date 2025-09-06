@@ -3,6 +3,8 @@ ingest.py
 Crawl your site (scoped to one host), extract clean text from HTML,
 split into chunks, and save them to data/chunks.jsonl
 
+NEW: Extract timetable rows (stop -> list of times) into data/timetables.json
+
 Optional: if retriever.py is available and you pass --build-index,
 this script will also build the TF-IDF index on disk.
 """
@@ -20,9 +22,9 @@ from typing import List, Dict, Set, Tuple
 import requests
 from bs4 import BeautifulSoup
 from urllib.robotparser import RobotFileParser
+from timetables import extract_timetables_from_html  # NEW
 
-
-# ---- Settings from environment (configured in .env / render.yaml) ----
+# ---- Settings from environment (configured in .env / Render dashboard) ----
 SITE_SEED_URL = os.environ.get("SITE_SEED_URL", "https://alfredorabelo.com/").strip()
 SITE_ALLOWED_HOST = os.environ.get("SITE_ALLOWED_HOST", "alfredorabelo.com").strip()
 CRAWL_MAX_DEPTH = int(os.environ.get("CRAWL_MAX_DEPTH", "2"))
@@ -32,11 +34,11 @@ RATE_LIMIT = float(os.environ.get("RATE_LIMIT", "1.0"))  # seconds between reque
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 CHUNKS_PATH = os.path.join(DATA_DIR, "chunks.jsonl")
+TIMETABLES_PATH = os.path.join(DATA_DIR, "timetables.json")  # NEW
 
 HEADERS = {
     "User-Agent": "RTS-QA-Agent/1.0 (+https://example.com)"
 }
-
 
 # ------------------------- Helpers -------------------------
 
@@ -58,11 +60,9 @@ def norm_url(u: str) -> str:
     cleaned = parsed._replace(query="", fragment="").geturl()
     return cleaned
 
-
 def is_html_response(resp: requests.Response) -> bool:
     ctype = (resp.headers.get("Content-Type") or "").lower()
     return "text/html" in ctype or "application/xhtml+xml" in ctype
-
 
 def load_robots_txt(seed_url: str) -> RobotFileParser:
     parsed = urlparse.urlparse(seed_url)
@@ -72,30 +72,24 @@ def load_robots_txt(seed_url: str) -> RobotFileParser:
         rp.set_url(robots_url)
         rp.read()
     except Exception:
-        # If robots fetch fails, be conservative: allow crawling the seed only.
         rp = RobotFileParser()
         rp.parse(["User-agent: *", "Allow: /"])
     return rp
 
-
 def allowed_by_robots(rp: RobotFileParser, url: str) -> bool:
     return rp.can_fetch(HEADERS["User-Agent"], url)
-
 
 def clean_html_to_text(html: str) -> Tuple[str, str]:
     """Return (title, cleaned_text) from HTML."""
     soup = BeautifulSoup(html, "lxml")
 
-    # Remove obvious non-content elements
     for tag in soup(["script", "style", "noscript", "iframe", "svg", "canvas"]):
         tag.decompose()
     for sel in ["header", "footer", "nav", "form", "aside"]:
         for t in soup.select(sel):
             t.decompose()
 
-    # Try to keep main content if the site uses <main>
     main = soup.select_one("main") or soup.body or soup
-
     title = ""
     if soup.title and soup.title.string:
         title = soup.title.string.strip()
@@ -105,28 +99,8 @@ def clean_html_to_text(html: str) -> Tuple[str, str]:
             title = h1.get_text(strip=True)
 
     text = main.get_text(separator="\n", strip=True)
-    # Collapse excessive blank lines
     text = re.sub(r"\n{3,}", "\n\n", text)
     return title, text
-
-
-def chunk_text(text: str, chunk_size: int = 1200, overlap: int = 200) -> List[str]:
-    """Simple character-based chunking with overlap."""
-    text = text.strip()
-    if not text:
-        return []
-    chunks = []
-    start = 0
-    n = len(text)
-    while start < n:
-        end = min(start + chunk_size, n)
-        chunk = text[start:end]
-        chunks.append(chunk)
-        if end == n:
-            break
-        start = max(0, end - overlap)
-    return chunks
-
 
 @dataclass
 class PageDoc:
@@ -134,13 +108,14 @@ class PageDoc:
     title: str
     text: str
 
-
 # ------------------------- Crawler -------------------------
 
-def crawl(seed_url: str, max_depth: int, rate_limit: float) -> List[PageDoc]:
+def crawl(seed_url: str, max_depth: int, rate_limit: float) -> Tuple[List[PageDoc], List[Dict]]:
+    """Return (docs, timetable_records)."""
     os.makedirs(CACHE_DIR, exist_ok=True)
     seen: Set[str] = set()
     docs: List[PageDoc] = []
+    tt_records: List[Dict] = []  # NEW
 
     rp = load_robots_txt(seed_url)
 
@@ -166,9 +141,19 @@ def crawl(seed_url: str, max_depth: int, rate_limit: float) -> List[PageDoc]:
         if resp.status_code != 200 or not is_html_response(resp):
             continue
 
+        # Clean text for search index
         title, text = clean_html_to_text(resp.text)
         if text:
             docs.append(PageDoc(url=url, title=title, text=text))
+
+        # Extract timetable rows from the raw HTML (NEW)
+        try:
+            rows = extract_timetables_from_html(resp.text, url=url, title_text=title)
+            if rows:
+                tt_records.extend(rows)
+        except Exception:
+            # Don't let parsing issues stop the crawl
+            pass
 
         # Enqueue links if we haven't exceeded depth
         if depth < max_depth:
@@ -177,7 +162,7 @@ def crawl(seed_url: str, max_depth: int, rate_limit: float) -> List[PageDoc]:
                 href = a.get("href")
                 if not href:
                     continue
-                if href.startswith("mailto:") or href.startswith("tel:"):
+                if href.startswith(("mailto:", "tel:")):
                     continue
                 nu = norm_url(href)
                 if not nu or nu in seen:
@@ -185,18 +170,16 @@ def crawl(seed_url: str, max_depth: int, rate_limit: float) -> List[PageDoc]:
                 seen.add(nu)
                 q.put((nu, depth + 1))
 
-    return docs
+    return docs, tt_records
 
-
-# ------------------------- Save Chunks -------------------------
+# ------------------------- Save Chunks & Timetables -------------------------
 
 def save_chunks(docs: List[PageDoc], path: str) -> int:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     count = 0
     with open(path, "w", encoding="utf-8") as f:
         for d in docs:
-            chunks = chunk_text(d.text)
-            for i, ch in enumerate(chunks):
+            for i, ch in enumerate(_chunk_text(d.text)):
                 rec = {
                     "url": d.url,
                     "title": d.title,
@@ -207,22 +190,61 @@ def save_chunks(docs: List[PageDoc], path: str) -> int:
                 count += 1
     return count
 
+def _chunk_text(text: str, chunk_size: int = 1200, overlap: int = 200) -> List[str]:
+    text = (text or "").strip()
+    if not text:
+        return []
+    out, n, i = [], len(text), 0
+    while i < n:
+        j = min(i + chunk_size, n)
+        out.append(text[i:j])
+        if j == n:
+            break
+        i = max(0, j - overlap)
+    return out
+
+def _dedupe_timetables(records: List[Dict]) -> List[Dict]:
+    """Merge times for identical (route, day, stop)."""
+    merged: Dict[Tuple[str, str, str], Dict] = {}
+    for r in records:
+        key = (r.get("route", ""), r.get("day", ""), (r.get("stop") or "").strip().lower())
+        if key not in merged:
+            merged[key] = {
+                "route": key[0], "day": key[1], "stop": key[2],
+                "times": [], "url": r.get("url"), "title": r.get("title"), "direction": r.get("direction", "")
+            }
+        # merge times uniquely
+        for t in r.get("times", []):
+            if t not in merged[key]["times"]:
+                merged[key]["times"].append(t)
+    # sort times lexicographically (works for HH:MM)
+    for v in merged.values():
+        v["times"].sort()
+    return list(merged.values())
+
+def save_timetables(records: List[Dict], path: str) -> int:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    clean = _dedupe_timetables(records)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(clean, f, ensure_ascii=False, indent=2)
+    return len(clean)
 
 # ------------------------- Main -------------------------
 
 def main(build_index: bool):
     print(f"[ingest] Seed: {SITE_SEED_URL}  Host: {SITE_ALLOWED_HOST}  Depth: {CRAWL_MAX_DEPTH}")
     print(f"[ingest] Rate limit: {RATE_LIMIT}s  Output: {CHUNKS_PATH}")
-
-    docs = crawl(SITE_SEED_URL, CRAWL_MAX_DEPTH, RATE_LIMIT)
+    docs, tt = crawl(SITE_SEED_URL, CRAWL_MAX_DEPTH, RATE_LIMIT)
     print(f"[ingest] Crawled pages: {len(docs)}")
-
     n_chunks = save_chunks(docs, CHUNKS_PATH)
     print(f"[ingest] Wrote chunks: {n_chunks} -> {CHUNKS_PATH}")
 
+    n_tt = save_timetables(tt, TIMETABLES_PATH)
+    print(f"[ingest] Timetable rows saved: {n_tt} -> {TIMETABLES_PATH}")
+
     if build_index:
         try:
-            import retriever  # we will add this file next
+            import retriever  # we will add this file next (already added in your repo)
             retriever.build_index_from_chunks(
                 chunks_path=CHUNKS_PATH,
                 index_path=os.path.join(DATA_DIR, "index.pkl"),
@@ -231,7 +253,6 @@ def main(build_index: bool):
             print("[ingest] Index built successfully.")
         except ImportError:
             print("[ingest] retriever.py not found yet. Skipping index build.")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Crawl site and build chunks (and optionally index).")
