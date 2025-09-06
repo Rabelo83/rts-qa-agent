@@ -12,7 +12,9 @@ CRAWL_MAX_DEPTH = int(os.environ.get("CRAWL_MAX_DEPTH", "2"))
 CACHE_DIR = os.environ.get("CACHE_DIR", ".site_cache")
 PORT = int(os.environ.get("PORT", "8000"))
 
-DATA_DIR = "data"
+# (near the top of app.py, below imports and load_dotenv)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
 INDEX_PATH = os.path.join(DATA_DIR, "index.pkl")
 CATALOG_PATH = os.path.join(DATA_DIR, "catalog.jsonl")
 
